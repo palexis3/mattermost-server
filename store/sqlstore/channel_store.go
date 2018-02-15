@@ -1469,3 +1469,51 @@ func (s SqlChannelStore) GetMembersByIds(channelId string, userIds []string) sto
 		}
 	})
 }
+
+func (s SqlChannelStore) GetChannelsWithChannelScopePermission(userId string, permissionName string) store.StoreChannel {
+	// This will need to be queried with, for example, 'select count(*) from roles' when custom roles are enabled
+	roleCount := len(model.MakeDefaultRoles())
+
+	query := `
+		select Channels.* from (
+		select
+		ChannelId, UserId, trim(substring_index(substring_index(B.Roles, ' ', ns.n), ' ', -1)) as rolename
+		from (
+		select 1 as n union all `
+
+	for i := 2; i < roleCount; i++ {
+		query += fmt.Sprintf("select %v union all\n", i)
+	}
+
+	query += `select ` + fmt.Sprintf("%v", roleCount) + `
+		) ns
+		inner join ChannelMembers B ON ns.n <= char_length(B.Roles) - char_length(replace(B.Roles, ' ', '')) + 1
+		) x
+		left join Channels on ChannelId = Channels.Id
+		left join Roles on Roles.name = x.rolename
+		where Roles.Permissions REGEXP '[[:<:]]` + permissionName + `[[:>:]]'
+		and UserId = :UserId`
+
+	if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		query = `
+			select channels.* from (
+				select userid, channelid, unnest(string_to_array(roles, ' ')) as rolename from channelmembers
+			) x
+			left join channels on channelid = channels.id
+			left join roles on roles.name = x.rolename
+			where string_to_array(roles.permissions, ' ') && '{` + permissionName + `}'::text[]
+			and userid = :UserId`
+	}
+
+	return store.Do(func(result *store.StoreResult) {
+		var channels model.ChannelList
+		_, err := s.GetReplica().Select(&channels, query, map[string]interface{}{"UserId": userId, "PermissionName": permissionName})
+		if err != nil {
+			fmt.Printf("err: %v", err)
+			result.Err = model.NewAppError("SqlChannelStore.GetChannelsWithChannelScopePermission", "store.sql_channel.get_channel_ids_with_permission.app_error", nil, "", http.StatusInternalServerError)
+		} else {
+			result.Data = &channels
+		}
+	})
+
+}

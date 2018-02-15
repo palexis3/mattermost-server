@@ -298,7 +298,14 @@ func searchPosts(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 
-	posts, err := c.App.SearchPostsInTeam(terms, c.Session.UserId, c.Params.TeamId, isOrSearch)
+	searchParams := model.ParseSearchParams(terms)
+	searchParams, err := searchParamsAdjustedForPermissions(c, searchParams)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	posts, err := c.App.SearchPostsInTeam(searchParams, c.Session.UserId, c.Params.TeamId, isOrSearch)
 
 	elapsedTime := float64(time.Since(startTime)) / float64(time.Second)
 	metrics := c.App.Metrics
@@ -314,6 +321,59 @@ func searchPosts(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Write([]byte(c.App.PostListWithProxyAddedToImageURLs(posts).ToJson()))
+}
+
+func searchParamsAdjustedForPermissions(c *Context, searchParams []*model.SearchParams) ([]*model.SearchParams, *model.AppError) {
+	hasSystemReadChannel := c.App.HasPermissionTo(c.Session.UserId, model.PERMISSION_READ_CHANNEL)
+	hasTeamReadChannel := c.App.HasPermissionToTeam(c.Session.UserId, c.Params.TeamId, model.PERMISSION_READ_CHANNEL)
+
+	// If user has the higher the read_channel pernmission in the system or team context then return the search params unchanged.
+	if hasSystemReadChannel || hasTeamReadChannel {
+		return searchParams, nil
+	}
+
+	// Get the list of channels that the user has read_channel permissions for
+	channelsWithChannelReadChannelPermission, err := c.App.GetChannelsWithChannelScopePermission(c.Session.UserId, model.PERMISSION_READ_CHANNEL.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get just the channel names
+	var channelNames []string
+	for _, channel := range *channelsWithChannelReadChannelPermission {
+		channelNames = append(channelNames, channel.Name)
+	}
+
+	// Get the union of channals the user searched and the channels they searched in using 'in:' terms
+	var unionSetOfChannelNames []string
+	for _, searchParam := range searchParams {
+		if len(searchParam.InChannels) > 0 {
+			unionSetOfChannelNames = unionSet(searchParam.InChannels, channelNames)
+		} else {
+			unionSetOfChannelNames = channelNames
+		}
+		searchParam.InChannels = unionSetOfChannelNames
+	}
+
+	// If the union of channels user searched within and the read-permitted channels is empty
+	// then clear the search params because there's nothing they can see in their requested search
+	if len(unionSetOfChannelNames) == 0 {
+		searchParams = model.ParseSearchParams("")
+	}
+
+	return searchParams, nil
+}
+
+func unionSet(set1 []string, set2 []string) []string {
+	uSet := []string{}
+	for _, i1 := range set1 {
+		for _, i2 := range set2 {
+			if i2 == i1 {
+				uSet = append(uSet, i1)
+			}
+		}
+	}
+	return uSet
 }
 
 func updatePost(c *Context, w http.ResponseWriter, r *http.Request) {
